@@ -1,0 +1,96 @@
+#!/usr/bin/env python3
+from bs4 import BeautifulSoup
+import hashlib
+import base64
+import os
+import requests
+import sys
+import random
+import string
+import argparse
+
+def handle_error(message):
+    sys.stderr.write(f"Error: {message}\n")
+    sys.exit(1)
+
+def generate_unique_id(length=8):
+    letters = string.ascii_lowercase
+    return ''.join(random.choice(letters) for i in range(length))
+
+def main(input_file):
+    # Load HTML from the specified file
+    try:
+        with open(input_file, 'r') as f:
+            html_content = f.read()
+    except FileNotFoundError:
+        handle_error(f"File {input_file} not found.")
+
+    # Parse HTML with BeautifulSoup
+    soup = BeautifulSoup(html_content, 'html.parser')
+
+    # Initialize external script content
+    external_script_content = ""
+
+    # Process pre-existing inline and external scripts
+    for script_tag in soup.find_all("script"):
+        src = script_tag.get("src")
+        if src:
+            if src.startswith("http"):
+                try:
+                    response = requests.get(src)
+                    response.raise_for_status()
+                    external_script_content += response.text + "\n"
+                except requests.RequestException as e:
+                    handle_error(f"Failed to fetch remote script {src}: {e}")
+            else:
+                try:
+                    with open(src, 'r') as f:
+                        external_script_content += f.read() + "\n"
+                except FileNotFoundError:
+                    handle_error(f"Local script file {src} not found.")
+        else:
+            external_script_content += script_tag.string + "\n"
+
+        script_tag.extract()
+
+    # Loop through HTML to find inline event handlers
+    for tag in soup.find_all(True):
+        for attr in tag.attrs.copy():
+            if attr.startswith('on'):
+                unique_id = generate_unique_id()
+                class_attr = tag.get("class", [])
+                class_attr.append(unique_id)
+                tag['class'] = " ".join(class_attr)
+
+                js_code = tag.attrs.pop(attr)
+                handler_content = f'document.addEventListener("DOMContentLoaded", function() {{ document.querySelector(".{unique_id}").addEventListener("{attr[2:]}", function() {{ {js_code} }}); }});'
+                external_script_content += handler_content + "\n"
+
+    # Create an external script tag
+    external_script_tag = soup.new_tag("script", src="script.js", type="text/javascript")
+    soup.head.append(external_script_tag)
+
+    # Generate a SHA-256 hash of the external script content
+    sha256_hash = base64.b64encode(hashlib.sha256(external_script_content.encode()).digest()).decode()
+    csp_header = f"Content-Security-Policy: script-src 'sha256-{sha256_hash}'"
+
+    # Save the updated HTML and external script
+    name = generate_unique_id()
+    base_name = os.path.splitext(os.path.basename(input_file))[0]
+    try:
+        with open(f'{base_name}_{name}.html', 'w') as f:
+            f.write(str(soup))
+        with open(f'script_{name}.js', 'w') as f:
+            f.write(external_script_content)
+    except Exception as e:
+        handle_error(f"Failed to write to files: {e}")
+
+    print(f"HTML and JavaScript files have been updated:\n  {base_name}_{name}.html\n  script_{name}.js")
+    print("Required CSP Header:\n ", csp_header)
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description='Convert an HTML file with unsafe inline event handlers to one with external scripts allowed by their hash via Content Security Policy.')
+    parser.add_argument('input_file', type=str, help='HTML file to be processed.')
+    args = parser.parse_args()
+    main(args.input_file)
+
